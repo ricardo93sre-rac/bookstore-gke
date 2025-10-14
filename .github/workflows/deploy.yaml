@@ -11,7 +11,7 @@ permissions:
 
 env:
   CLUSTER_NAME: bookstore-gke
-  K8S_MANIFEST: k8s/deploy.yaml      # ruta a tu manifiesto
+  K8S_MANIFEST: k8s/deployment.yaml      # ruta a tu manifiesto
   DEPLOYMENT_NAME: bookstore-deploy
   SERVICE_NAME: bookstore-service
   CONTAINER_NAME: boookstoreapp       # tal como está en tu YAML (ojo al nombre)
