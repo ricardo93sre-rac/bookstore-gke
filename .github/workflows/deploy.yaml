@@ -94,7 +94,7 @@ jobs:
     - name: Get GKE credentials
       run: |
         gcloud container clusters get-credentials ${CLUSTER_NAME} --region ${REGION} --project ${PROJECT_ID}
-        kubectl version --client --short
+        kubectl version
 
     - name: Prepare manifest (replace image) and apply
       env:
