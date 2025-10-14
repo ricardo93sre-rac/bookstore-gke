@@ -30,7 +30,18 @@ jobs:
         IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/bookstore-gke:${{ github.sha }}"
         docker build -t $IMAGE .
         docker push $IMAGE
-
+    
+    - name: Install gcloud SDK
+      uses: google-github-actions/setup-gcloud@v3
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+        version: 'latest'
+    
+    - name: Install gke-gcloud-auth-plugin
+      run: |
+        gcloud --quiet components install gke-gcloud-auth-plugin
+        gke-gcloud-auth-plugin --version || true    
+  
     - name: Get GKE credentials
       run: |
         gcloud container clusters get-credentials bookstore-gke --region ${{ secrets.GCP_REGION }} --project ${{ secrets.GCP_PROJECT_ID }}
