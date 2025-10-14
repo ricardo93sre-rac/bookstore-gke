@@ -49,5 +49,5 @@ jobs:
     - name: Deploy to GKE
       run: |
         IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/bookstore-gke:${{ github.sha }}"
-        kubectl set image deployment/bookstore-deployment bookstore=$IMAGE --record
-        kubectl rollout status deployment/bookstore-deployment --timeout=120s
+        kubectl set image deployment/bookstore-deploy bookstore=$IMAGE --record
+        kubectl rollout status deployment/bookstore-deploy --timeout=120s
