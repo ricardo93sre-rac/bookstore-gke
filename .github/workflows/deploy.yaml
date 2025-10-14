@@ -1,53 +1,148 @@
-name: CI/CD to GKE
+name: CI/CD → GKE (Artifact Registry) with SDK deps
 
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: 'read'
+  id-token: 'write'
+
+env:
+  CLUSTER_NAME: bookstore-gke
+  K8S_MANIFEST: k8s/manifest.yaml      # ruta a tu manifiesto
+  DEPLOYMENT_NAME: bookstore-deploy
+  SERVICE_NAME: bookstore-service
+  CONTAINER_NAME: boookstoreapp       # tal como está en tu YAML (ojo al nombre)
+  ARTIFACT_REPO: ${{ secrets.ARTIFACT_REPO }}
+  REGION: ${{ secrets.GCP_REGION }}
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
 
 jobs:
-  build-deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
+    - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Authenticate to Google Cloud
+    # -----------------------
+    # Instalar dependencias del SDK (apt repo de Google)
+    # -----------------------
+    - name: Install Cloud SDK dependencies and packages
+      run: |
+        set -euo pipefail
+        echo "Instalando dependencias del Cloud SDK y kubectl/gke plugin..."
+
+        # Añadir clave GPG y repo de Google Cloud SDK
+        sudo apt-get update -y
+        sudo apt-get install -y apt-transport-https ca-certificates gnupg lsb-release curl
+
+        # Añadir la llave y el repo oficial de Google Cloud
+        curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+
+        # Actualizar e instalar google-cloud-sdk, kubectl y el plugin gke-gcloud-auth-plugin
+        sudo apt-get update -y
+        sudo apt-get install -y google-cloud-sdk google-cloud-sdk-gke-gcloud-auth-plugin kubectl
+
+        # Verificaciones rápidas
+        echo "gcloud version:"
+        gcloud --version || true
+        echo "kubectl version (client):"
+        kubectl version --client --short || true
+        echo "gke-gcloud-auth-plugin version:"
+        gke-gcloud-auth-plugin --version || true
+
+    # -----------------------
+    # Autenticación a GCP (Service Account JSON)
+    # -----------------------
+    - name: Authenticate to Google Cloud (Service Account)
       uses: google-github-actions/auth@v3
       with:
         credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-    - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@v3
-      with:
-        project_id: ${{ secrets.GCP_PROJECT_ID }}
-
-    - name: Configure Docker
-      run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
-
-    - name: Build and push image
+    - name: Set gcloud project
       run: |
-        IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/bookstore-gke:${{ github.sha }}"
-        docker build -t $IMAGE .
-        docker push $IMAGE
-    
-    - name: Install gcloud SDK
-      uses: google-github-actions/setup-gcloud@v3
-      with:
-        project_id: ${{ secrets.GCP_PROJECT_ID }}
-        version: 'latest'
-    
-    - name: Install gke-gcloud-auth-plugin
+        gcloud config set project ${{ env.PROJECT_ID }}
+        gcloud config set compute/region ${{ env.REGION }}
+
+    # -----------------------
+    # Configurar Docker para Artifact Registry y construir/push
+    # -----------------------
+    - name: Configure Docker for Artifact Registry
       run: |
-        gcloud --quiet components install gke-gcloud-auth-plugin
-        gke-gcloud-auth-plugin --version || true    
-  
+        gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+
+    - name: Set up Docker buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Build and push image to Artifact Registry
+      id: buildpush
+      run: |
+        set -euo pipefail
+        IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/boookstoreapp:${{ github.sha }}"
+        echo "Building image: $IMAGE"
+        docker build -t "$IMAGE" .
+        docker push "$IMAGE"
+        echo "::set-output name=image::$IMAGE"
+
+    # -----------------------
+    # Obtener credenciales GKE y aplicar manifiesto
+    # -----------------------
     - name: Get GKE credentials
       run: |
-        gcloud container clusters get-credentials bookstore-gke --region ${{ secrets.GCP_REGION }} --project ${{ secrets.GCP_PROJECT_ID }}
+        gcloud container clusters get-credentials ${CLUSTER_NAME} --region ${REGION} --project ${PROJECT_ID}
+        kubectl version --client --short
 
-    - name: Deploy to GKE
+    - name: Prepare manifest (replace image) and apply
+      env:
+        IMAGE: ${{ steps.buildpush.outputs.image }}
+        MANIFEST: ${{ env.K8S_MANIFEST }}
       run: |
-        IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REPO }}/bookstore-gke:${{ github.sha }}"
-        kubectl set image deployment/bookstore-deploy bookstore=$IMAGE --record
-        kubectl rollout status deployment/bookstore-deploy --timeout=120s
+        set -euo pipefail
+        echo "Manifest path: $MANIFEST"
+        if [ ! -f "$MANIFEST" ]; then
+          echo "ERROR: manifiesto no encontrado en $MANIFEST"
+          ls -la
+          exit 1
+        fi
+
+        # Backup del manifiesto
+        cp "$MANIFEST" "${MANIFEST}.bak"
+
+        # Reemplazo robusto:
+        # Si tu manifiesto usa IMAGE_PLACEHOLDER, reemplazar todas las ocurrencias.
+        if grep -Rq "IMAGE_PLACEHOLDER" "$MANIFEST"; then
+          echo "Usando placeholder: reemplazando IMAGE_PLACEHOLDER por $IMAGE"
+          sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}|g" "$MANIFEST"
+        else
+          # Si no hay placeholder, reemplazamos la PRIMERA línea 'image:' encontrada por la nueva imagen
+          echo "No se detectó IMAGE_PLACEHOLDER; reemplazando la primera ocurrencia de 'image:' por $IMAGE"
+          sed -E "0,/image: .*/s|image: .*|image: ${IMAGE}|" "${MANIFEST}.bak" > "$MANIFEST"
+        fi
+
+        echo "Contenido del manifiesto modificado (preview):"
+        sed -n '1,200p' "$MANIFEST" || true
+
+        # Aplicar manifiesto(s)
+        kubectl apply -f "$MANIFEST"
+
+    - name: Wait rollout (deployment)
+      env:
+        DEPLOYMENT_NAME: ${{ env.DEPLOYMENT_NAME }}
+      run: |
+        set -euo pipefail
+        echo "Esperando rollout del deployment ${DEPLOYMENT_NAME}..."
+        kubectl rollout status deployment/${DEPLOYMENT_NAME} --timeout=180s || {
+          echo "Rollout falló — mostrando estado y eventos para debug"
+          kubectl describe deployment ${DEPLOYMENT_NAME} || true
+          kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
+          exit 1
+        }
+
+    - name: Show service external IP
+      run: |
+        echo "Service ${SERVICE_NAME} (puede tardar en obtener EXTERNAL-IP):"
+        kubectl get svc ${SERVICE_NAME} -o wide
